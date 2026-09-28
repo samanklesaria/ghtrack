@@ -6,41 +6,77 @@ from dateutil import parser as date_parser
 import httpx
 import trio
 
+async def get_all(client, url, **params):
+    """Paginate a GitHub list endpoint, retrying rate limits. Raises rather than dropping data."""
+    items = []
+    for page in range(1, 100):
+        for attempt in range(6):
+            response = await client.get(url, params={'per_page': 100, 'page': page, **params})
+            if response.status_code == 200:
+                break
+            if response.status_code in (403, 429) or response.status_code >= 500:
+                # ponytail: blind backoff; read retry-after/x-ratelimit-reset if this stays slow
+                await trio.sleep(min(60, 2 ** attempt))
+                continue
+            raise RuntimeError(f"{url} page {page} returned {response.status_code}")
+        else:
+            raise RuntimeError(f"{url} page {page} still failing after retries")
+
+        batch = response.json()
+        items.extend(batch)
+        if len(batch) < 100:
+            break
+    return items
+
+def commit_activity_date(commit, username, days):
+    """Date a commit landed under `username`, or None if it isn't theirs / is too old.
+
+    Uses the committer as well as the author, and the later of the two dates: a rebase or
+    force-push replays old authored dates but stamps a fresh committer date.
+    """
+    logins = {(commit.get(role) or {}).get('login') for role in ('author', 'committer')}
+    if username not in logins:
+        return None
+
+    date = max(date_parser.isoparse(commit['commit'][role]['date']) for role in ('author', 'committer'))
+    return date if date >= datetime.now(date.tzinfo) - timedelta(days=days) else None
+
+def mine_and_recent(entries, username, days):
+    """Keep the user's own comments/reviews from the last `days`, summarised for the report."""
+    kept = []
+    for entry in entries:
+        if (entry.get('user') or {}).get('login') != username:
+            continue
+
+        # Reviews carry submitted_at, and are absent until submitted; comments carry created_at
+        stamp = entry.get('created_at') or entry.get('submitted_at')
+        if not stamp or entry.get('state') == 'PENDING':
+            continue
+
+        date = date_parser.isoparse(stamp)
+        if date < datetime.now(date.tzinfo) - timedelta(days=days):
+            continue
+
+        # An approval or plain review request has no body, so fall back to its state
+        body = entry.get('body') or entry.get('state', '').lower().replace('_', ' ')
+        kept.append({'date': date, 'body': body[:100] + ('...' if len(body) > 100 else '')})
+    return kept
+
 async def fetch_commits_for_pr(client, repo, pr_number, pr, username, days):
     """Fetch commits for a single PR asynchronously."""
     commits_url = f"https://api.github.com/repos/{repo}/pulls/{pr_number}/commits"
 
     try:
-        # Fetch all pages of commits
-        commits = []
-        page = 1
-        while True:
-            params = {'per_page': 100, 'page': page}
-            commits_response = await client.get(commits_url, params=params)
-
-            if commits_response.status_code != 200:
-                if page == 1:
-                    return None
-                break
-
-            page_commits = commits_response.json()
-            if not page_commits:
-                break
-
-            commits.extend(page_commits)
-            page += 1
-
         user_commits = []
 
-        for commit in commits:
-            if commit.get('author') and commit['author'].get('login') == username:
-                commit_date = date_parser.isoparse(commit['commit']['author']['date'])
-                if commit_date >= datetime.now(commit_date.tzinfo) - timedelta(days=days):
-                    user_commits.append({
-                        'sha': commit['sha'][:7],
-                        'date': commit_date,
-                        'message': commit['commit']['message'].split('\n')[0]
-                    })
+        for commit in await get_all(client, commits_url):
+            commit_date = commit_activity_date(commit, username, days)
+            if commit_date:
+                user_commits.append({
+                    'sha': commit['sha'][:9],
+                    'date': commit_date,
+                    'message': commit['commit']['message'].split('\n')[0]
+                })
 
         if user_commits:
             pr_key = f"{repo}#{pr_number}"
@@ -67,44 +103,6 @@ async def fetch_commits_for_pr(client, repo, pr_number, pr, username, days):
 
     return None
 
-async def get_pr_activity(client, nursery, username, days, all_results, search_counter, since_date):
-    """Fetch PR activity with pagination, stopping when pages are empty."""
-    search_url = 'https://api.github.com/search/issues'
-    query = f'is:pr author:{username} updated:>={since_date}'
-
-    # Fetch pages sequentially, stop when empty
-    for page in range(1, 11):  # Pages 1-10
-        params = {'q': query, 'per_page': 100, 'sort': 'updated', 'order': 'desc', 'page': page}
-
-        try:
-            response = await client.get(search_url, params=params)
-            search_counter['count'] += 1
-
-            if response.status_code != 200:
-                print(f"Warning: PR search page {page} returned {response.status_code}", file=sys.stderr)
-                break
-
-            data = response.json()
-            prs = data.get('items', [])
-
-            if not prs:
-                break  # Stop pagination if page is empty
-
-            # Fetch commits for all PRs on this page using the parent nursery
-            async def fetch_and_store(pr):
-                repo = pr['repository_url'].replace('https://api.github.com/repos/', '')
-                pr_number = pr['number']
-                result = await fetch_commits_for_pr(client, repo, pr_number, pr, username, days)
-                if result:
-                    all_results.append(result)
-
-            for pr in prs:
-                nursery.start_soon(fetch_and_store, pr)
-
-        except Exception as e:
-            print(f"Error fetching page {page}: {e}", file=sys.stderr)
-            break
-
 async def fetch_comments_for_item(client, item, username, days, is_issue=False, fetch_review_comments=False):
     """Fetch comments for a single PR or issue asynchronously."""
     repo = item['repository_url'].replace('https://api.github.com/repos/', '')
@@ -112,73 +110,14 @@ async def fetch_comments_for_item(client, item, username, days, is_issue=False, 
     comments_url = item['comments_url']
 
     try:
-        # Fetch all pages of regular comments
-        comments = []
-        page = 1
-        while True:
-            params = {'per_page': 100, 'page': page}
-            comments_response = await client.get(comments_url, params=params)
+        user_comments = mine_and_recent(await get_all(client, comments_url), username, days)
 
-            if comments_response.status_code != 200:
-                if page == 1:
-                    return None
-                break
-
-            page_comments = comments_response.json()
-            if not page_comments:
-                break
-
-            comments.extend(page_comments)
-            page += 1
-
-        user_comments = []
-
-        for comment in comments:
-            if comment['user']['login'] == username:
-                comment_date = date_parser.isoparse(comment['created_at'])
-                cutoff_date = datetime.now(comment_date.tzinfo) - timedelta(days=days)
-
-                if comment_date >= cutoff_date:
-                    user_comments.append({
-                        'date': comment_date,
-                        'body': comment['body'][:100] + ('...' if len(comment['body']) > 100 else '')
-                    })
-
-        # Fetch review comments (inline code comments) for PRs
+        # Inline code comments plus the reviews themselves (an approval carries no inline comment)
         user_review_comments = []
         if not is_issue and fetch_review_comments:
-            review_comments_url = f"https://api.github.com/repos/{repo}/pulls/{number}/comments"
-
-            try:
-                # Fetch all pages of review comments
-                review_comments = []
-                page = 1
-                while True:
-                    params = {'per_page': 100, 'page': page}
-                    review_response = await client.get(review_comments_url, params=params)
-
-                    if review_response.status_code != 200:
-                        break
-
-                    page_review_comments = review_response.json()
-                    if not page_review_comments:
-                        break
-
-                    review_comments.extend(page_review_comments)
-                    page += 1
-
-                for comment in review_comments:
-                    if comment['user']['login'] == username:
-                        comment_date = date_parser.isoparse(comment['created_at'])
-                        cutoff_date = datetime.now(comment_date.tzinfo) - timedelta(days=days)
-
-                        if comment_date >= cutoff_date:
-                            user_review_comments.append({
-                                'date': comment_date,
-                                'body': comment['body'][:100] + ('...' if len(comment['body']) > 100 else '')
-                            })
-            except Exception as e:
-                print(f"Error fetching review comments for {repo}#{number}: {e}", file=sys.stderr)
+            base = f"https://api.github.com/repos/{repo}/pulls/{number}"
+            user_review_comments = mine_and_recent(await get_all(client, f"{base}/comments"), username, days)
+            user_review_comments += mine_and_recent(await get_all(client, f"{base}/reviews"), username, days)
 
         if user_comments or user_review_comments:
             key = f"{repo}#{number}"
@@ -208,111 +147,36 @@ async def fetch_comments_for_item(client, item, username, days, is_issue=False, 
 
     return None
 
-async def fetch_pr_comments(client, nursery, username, since_date, days, all_results, search_counter):
-    """Fetch PRs where user commented (pages sequentially, stop when empty)."""
-    search_url = 'https://api.github.com/search/issues'
-    query = f'is:pr commenter:{username} updated:>={since_date} -author:{username}'
+async def search_activity(client, nursery, query, handle, search_counter):
+    """Page through a search query, dispatching each hit to `handle` on the shared nursery.
 
+    The search API allows only 30 requests/minute and we run several queries at once, so a 403
+    here means "slow down", not "no more results" -- backing off instead of breaking is the
+    difference between a full report and a truncated one.
+    """
     for page in range(1, 11):
         params = {'q': query, 'per_page': 100, 'sort': 'updated', 'order': 'desc', 'page': page}
 
-        try:
-            response = await client.get(search_url, params=params)
+        for attempt in range(6):
+            response = await client.get('https://api.github.com/search/issues', params=params)
             search_counter['count'] += 1
-
-            if response.status_code != 200:
-                print(f"Warning: PR comment search page {page} returned {response.status_code}", file=sys.stderr)
+            if response.status_code == 200:
                 break
+            if response.status_code in (403, 429) or response.status_code >= 500:
+                await trio.sleep(min(60, 2 ** attempt))
+                continue
+            print(f"Warning: search '{query}' page {page} returned {response.status_code}", file=sys.stderr)
+            return
+        else:
+            print(f"Warning: search '{query}' page {page} rate-limited out; results are incomplete", file=sys.stderr)
+            return
 
-            data = response.json()
-            items = data.get('items', [])
+        items = response.json().get('items', [])
+        for item in items:
+            nursery.start_soon(handle, item)
 
-            if not items:
-                break  # Stop pagination if page is empty
-
-            # Fetch comments AND review comments for all items on this page using the parent nursery
-            async def fetch_and_store(item):
-                result = await fetch_comments_for_item(client, item, username, days, False, True)
-                if result:
-                    all_results.append(result)
-
-            for item in items:
-                nursery.start_soon(fetch_and_store, item)
-
-        except Exception as e:
-            print(f"Error fetching PR comment page {page}: {e}", file=sys.stderr)
-            break
-
-async def fetch_issue_comments(client, nursery, username, since_date, days, all_results, search_counter):
-    """Fetch issues where user commented (pages sequentially, stop when empty)."""
-    search_url = 'https://api.github.com/search/issues'
-    query = f'is:issue commenter:{username} updated:>={since_date} -author:{username}'
-
-    for page in range(1, 11):
-        params = {'q': query, 'per_page': 100, 'sort': 'updated', 'order': 'desc', 'page': page}
-
-        try:
-            response = await client.get(search_url, params=params)
-            search_counter['count'] += 1
-
-            if response.status_code != 200:
-                print(f"Warning: Issue comment search page {page} returned {response.status_code}", file=sys.stderr)
-                break
-
-            data = response.json()
-            items = data.get('items', [])
-
-            if not items:
-                break  # Stop pagination if page is empty
-
-            # Fetch comments for all items on this page using the parent nursery
-            async def fetch_and_store(item):
-                result = await fetch_comments_for_item(client, item, username, days, True)
-                if result:
-                    all_results.append(result)
-
-            for item in items:
-                nursery.start_soon(fetch_and_store, item)
-
-        except Exception as e:
-            print(f"Error fetching issue comment page {page}: {e}", file=sys.stderr)
-            break
-
-async def fetch_review_comments(client, nursery, username, since_date, days, all_results, search_counter):
-    """Fetch PRs where user made reviews or review comments (pages sequentially, stop when empty)."""
-    search_url = 'https://api.github.com/search/issues'
-    # Use reviewed-by OR commenter to catch all review activity
-    query = f'is:pr reviewed-by:{username} updated:>={since_date} -author:{username}'
-
-    for page in range(1, 11):
-        params = {'q': query, 'per_page': 100, 'sort': 'updated', 'order': 'desc', 'page': page}
-
-        try:
-            response = await client.get(search_url, params=params)
-            search_counter['count'] += 1
-
-            if response.status_code != 200:
-                print(f"Warning: Review comment search page {page} returned {response.status_code}", file=sys.stderr)
-                break
-
-            data = response.json()
-            items = data.get('items', [])
-
-            if not items:
-                break  # Stop pagination if page is empty
-
-            # Fetch review comments for all items on this page using the parent nursery
-            async def fetch_and_store(item):
-                result = await fetch_comments_for_item(client, item, username, days, False, True)
-                if result:
-                    all_results.append(result)
-
-            for item in items:
-                nursery.start_soon(fetch_and_store, item)
-
-        except Exception as e:
-            print(f"Error fetching review comment page {page}: {e}", file=sys.stderr)
-            break
+        if len(items) < 100:
+            return
 
 def generate_report(pr_activity, comment_activity, username):
     # Collect all activity by date
@@ -360,7 +224,7 @@ def generate_report(pr_activity, comment_activity, username):
             activity_by_date[date].add(url)
 
     if not activity_by_date:
-        print("No activity found in the last 7 days.")
+        print("No activity found in the last 9 days.")
         return
 
     # Print by day
@@ -450,7 +314,7 @@ async def main():
     try:
         # Fetch PR activity and comment activity in parallel
         search_counter = {'count': 0}
-        since = (datetime.now() - timedelta(days=7)).isoformat()
+        since = (datetime.now() - timedelta(days=9)).isoformat()
         since_date = since[:10]
 
         headers = {
@@ -461,12 +325,28 @@ async def main():
         async with httpx.AsyncClient(headers=headers, limits=httpx.Limits(max_connections=20)) as client:
             all_results = []
 
+            async def keep(result):
+                if result:
+                    all_results.append(result)
+
+            async def own_pr(pr):
+                repo = pr['repository_url'].replace('https://api.github.com/repos/', '')
+                await keep(await fetch_commits_for_pr(client, repo, pr['number'], pr, username, 9))
+
+            async def commented_pr(item):
+                await keep(await fetch_comments_for_item(client, item, username, 9, False, True))
+
+            async def commented_issue(item):
+                await keep(await fetch_comments_for_item(client, item, username, 9, True))
+
             async with trio.open_nursery() as nursery:
-                # Start PR activity and comment activity fetchers
-                nursery.start_soon(get_pr_activity, client, nursery, username, 7, all_results, search_counter, since_date)
-                nursery.start_soon(fetch_pr_comments, client, nursery, username, since_date, 7, all_results, search_counter)
-                nursery.start_soon(fetch_issue_comments, client, nursery, username, since_date, 7, all_results, search_counter)
-                nursery.start_soon(fetch_review_comments, client, nursery, username, since_date, 7, all_results, search_counter)
+                for query, handler in [
+                    (f'is:pr author:{username} updated:>={since_date}', own_pr),
+                    (f'is:pr commenter:{username} updated:>={since_date}', commented_pr),
+                    (f'is:issue commenter:{username} updated:>={since_date}', commented_issue),
+                    (f'is:pr reviewed-by:{username} updated:>={since_date} -author:{username}', commented_pr),
+                ]:
+                    nursery.start_soon(search_activity, client, nursery, query, handler, search_counter)
 
             # Separate results into pr_activity and comment_activity
             pr_result = {}
